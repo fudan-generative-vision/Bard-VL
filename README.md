@@ -1,8 +1,5 @@
 <h1 align="center">BARD: Bridging AutoRegressive and Diffusion Vision-Language Models Via Highly Efficient Progressive Block Merging and Stage-Wise Distillation</h1>
 
-<p align="center">
-  Official PyTorch implementation of Bard-VL, a family of block-diffusion vision-language models trained with Progressive Block Merging and Stage-Wise Distillation.
-</p>
 
 <p align="center">
   <a href="https://github.com/cbyzju">Baoyou Chen</a><sup>1,3</sup> ·
@@ -38,12 +35,14 @@
   <a href="#repository-layout"><img src="https://img.shields.io/badge/Repository-475569?style=flat&logoColor=white" alt="Repository"></a>
 </p>
 
-<p align="center">
-  <video width="960" height="540" controls autoplay muted loop playsinline>
-    <source src="https://github.com/user-attachments/assets/18c7bc8a-573f-42bc-8f6c-d5396e6367b2" type="video/mp4">
-  </video>
-</p>
 
+<table align='center' border="0" style="width: 100%; text-align: center; margin-top: 80px;">
+    <tr>
+      <td>
+        <video align='center' src="https://github.com/user-attachments/assets/1b5abd60-c88c-41a7-a029-0dd143c98262" muted autoplay loop></video>
+      </td>
+    </tr>
+  </table>
 
 <a id="quick-start"></a>
 ## 🚀 Quick Start
@@ -127,11 +126,11 @@ The training pipeline expects each sample to contain a `messages` field in chat 
 
 The PBM configs live under [`examples/vlm_finetune/bard_vl/`](./examples/vlm_finetune/bard_vl), and matching launch wrappers are available under [`scripts/`](./scripts).
 
-| Variant | Config | Launcher |
-| --- | --- | --- |
-| [`B4-Mask-2B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-2B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_2b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_2b_instruct.yaml) | [`scripts/bard_vl_b4_mask_2b_instruct.sh`](./scripts/bard_vl_b4_mask_2b_instruct.sh) |
-| [`B4-Mask-4B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-4B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_4b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_4b_instruct.yaml) | [`scripts/bard_vl_b4_mask_4b_instruct.sh`](./scripts/bard_vl_b4_mask_4b_instruct.sh) |
-| [`B4-Mask-8B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-8B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_8b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_8b_instruct.yaml) | [`scripts/bard_vl_b4_mask_8b_instruct.sh`](./scripts/bard_vl_b4_mask_8b_instruct.sh) |
+| Variant | Config |
+| --- | --- |
+| [`B4-Mask-2B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-2B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_2b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_2b_instruct.yaml) |
+| [`B4-Mask-4B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-4B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_4b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_4b_instruct.yaml) |
+| [`B4-Mask-8B-Instruct`](https://huggingface.co/fudan-generative-ai/Bard-VL-B4-Mask-8B-Instruct) | [`examples/vlm_finetune/bard_vl/bard_vl_b4_mask_8b_instruct.yaml`](./examples/vlm_finetune/bard_vl/bard_vl_b4_mask_8b_instruct.yaml) |
 
 Download the base checkpoints with:
 
@@ -153,7 +152,7 @@ exps/bard_vl_b4_mask_4b_instruct/epoch_0_step_19999/
 
 ### 3. Export Checkpoint
 
-The distillation configs expect HuggingFace-style model directories such as `pretrained_models/Bard-VL-B4-Mask-4B-Instruct`. If your PBM run produced a training checkpoint directory, export it with [`tools/consolidate_checkpoint.py`](./tools/consolidate_checkpoint.py):
+The distillation configs expect HuggingFace-style model directories such as `pretrained_models/Bard-VL-B4-Mask-4B-Instruct`. If your PBM training produced a checkpoint directory, export it with [`tools/consolidate_checkpoint.py`](./tools/consolidate_checkpoint.py):
 
 ```bash
 python3 tools/consolidate_checkpoint.py \
@@ -188,7 +187,7 @@ The shell launchers under [`scripts/`](./scripts) and the evaluation examples un
 <a id="inference"></a>
 ## 🎬 Inference
 
-[`inference.py`](./inference.py) contains minimal examples for image understanding, video understanding. Edit the `messages` list inside the script to select the modality and prompt you want to test.
+[`inference.py`](./inference.py) contains minimal examples for image and video understanding. Edit the `messages` list inside the script to select the modality and prompt you want to test.
 
 ```bash
 python3 inference.py \
@@ -222,7 +221,6 @@ accelerate launch --num_processes=1 --main_process_port=12346 -m lmms_eval \
 Alternatively, you can directly use a bash script for multi-node evaluation as shown below:
 ```bash
 cd eval/lmms-eval
-
 bash examples/models/bard_vl.sh
 ```
 
