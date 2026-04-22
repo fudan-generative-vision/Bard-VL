@@ -6,7 +6,7 @@
   <a href="https://github.com/1ring2rta">Hanchen Xia</a><sup>1</sup> ·
   <a href="https://github.com/yhpengtu-rgb">Peng Tu</a><sup>1</sup> ·
   <a href="https://github.com/Theseus-427">Haojun Shi</a><sup>1</sup> ·
-  <a href="https://github.com/AricGamma">Shan Mu</a><sup>1</sup> ·
+  <a href="https://github.com/AricGamma">Liwei Zhang</a><sup>1</sup> ·
   <a href="https://github.com/weihaosky">Weihao Yuan</a><sup>4</sup> ·
   <a href="https://sites.google.com/site/zhusiyucs/home">Siyu Zhu</a><sup>1,2,3,†</sup>
 </p>
@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/Project-HomePage-Green" alt="Project Page"></a>
+  <a href="https://fudan-generative-vision.github.io/Bard-VL"><img src="https://img.shields.io/badge/Project-HomePage-Green" alt="Project Page"></a>
   <a href="https://arxiv.org/pdf/2604.16514"><img src="https://img.shields.io/badge/Paper-Arxiv-red" alt="Paper"></a>
   <a href="https://huggingface.co/collections/fudan-generative-ai/bard-vl"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Model-yellow" alt="Hugging Face"></a>
 </p>
