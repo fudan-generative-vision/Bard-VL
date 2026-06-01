@@ -158,11 +158,18 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_embeddings: bool (default True)
         - freeze_vision_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - unfreeze_patterns: list[str] — name patterns to force unfreeze (applied last)
+        - freeze_patterns: list[str] — name patterns to force freeze (applied last)
+        - trainable_embed_token_ids: list[int] — specific token IDs whose embedding
+          rows remain trainable when freeze_embeddings=True
     """
     freeze_embeddings = freeze_config.get("freeze_embeddings", True)
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
+    unfreeze_patterns = freeze_config.get("unfreeze_patterns", [])
+    freeze_patterns = freeze_config.get("freeze_patterns", [])
+    trainable_embed_token_ids = freeze_config.get("trainable_embed_token_ids", None)
 
     # Freeze embeddings
     if freeze_embeddings:
@@ -181,6 +188,48 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Apply name-based unfreeze patterns (override previous freezing)
+    if unfreeze_patterns:
+        for name, param in model.named_parameters():
+            if any(p in name for p in unfreeze_patterns):
+                param.requires_grad = True
+
+    # Apply name-based freeze patterns (override previous unfreezing)
+    if freeze_patterns:
+        for name, param in model.named_parameters():
+            if any(p in name for p in freeze_patterns):
+                param.requires_grad = False
+
+    # Allow specific embedding rows to be trainable via gradient masking
+    if freeze_embeddings and trainable_embed_token_ids:
+        _setup_partial_embedding_training(model, trainable_embed_token_ids)
+
+
+def _setup_partial_embedding_training(model, token_ids):
+    """Enable gradient only for specific token IDs in the input embedding."""
+    import functools
+
+    embed = None
+    for name, m in model.named_modules():
+        if "embed_tokens" in name and isinstance(m, nn.Embedding):
+            embed = m
+            break
+
+    if embed is None:
+        return
+
+    embed.weight.requires_grad = True
+    trainable_ids = set(token_ids)
+
+    def _mask_grad(grad, ids=trainable_ids):
+        mask = torch.zeros(grad.shape[0], device=grad.device, dtype=grad.dtype)
+        for tid in ids:
+            if tid < grad.shape[0]:
+                mask[tid] = 1.0
+        return grad * mask.unsqueeze(1)
+
+    embed.weight.register_hook(_mask_grad)
 
 
 def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):

@@ -1,0 +1,94 @@
+# Stage 2C: Image Generation Training — 1024px (high quality)
+# Train: LLM full params, Vision Encoder, image_head, vq_embed
+# Freeze: Visual Tokenizer, lm_head
+# Steps: ~30K (high-quality subset, aesthetic >= 6.0)
+
+step_scheduler:
+  global_batch_size: 1024  # per_device=4 × grad_accum=16 × 16GPUs
+  local_batch_size: 4
+  ckpt_every_steps: 2000
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.components.models.bard_uni.BardUniForConditionalGeneration.from_pretrained
+  pretrained_model_name_or_path: exps/bard_uni_stage2b_gen_512/latest
+  attn_implementation: sdpa
+  torch_dtype: "torch.bfloat16"
+  vq_tokenizer_type: ibq
+  vq_model_path: pretrained_models/BAAI/Emu3.5-VisionTokenizer
+  vq_codebook_size: 131072
+  vq_weight_tying: false
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: pretrained_models/Bard-VL-B32-Mask-4B-Instruct
+  min_pixels: 65536
+  max_pixels: 16777216
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: exps/bard_uni_stage2c_gen_1024
+  model_save_format: torch_save
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.weighted_ce.WeightedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.bard_uni_dataset
+  path_or_dataset: datasets/t2i_stage2c_1024
+  task_type: text_to_image
+  max_len: 8192
+  drop_last: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.bard_uni_collate_fn
+    mask_token_id: 151671
+    block_size: 32
+    pad_token: <|im_end|>
+    min_mask_rate: 0.0
+    max_mask_rate: 1.0
+    cfg_uncond_drop_rate: 0.1
+    use_newline: false
+    mask_newline: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5e-6
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: 'cosine'
+  lr_warmup_steps: 500
+  min_lr: 5.0e-7
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+  trainable_embed_token_ids: [151672, 151673, 151675, 151676, 151677]
+  unfreeze_patterns:
+    - "image_head"
+    - "vq_embed"
+  freeze_patterns:
+    - "lm_head"
+
+clip_grad_norm:
+  max_norm: 1.0

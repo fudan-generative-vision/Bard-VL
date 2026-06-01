@@ -9,12 +9,24 @@ class WeightedCrossEntropy(nn.Module):
         fp32_upcast: bool = True,
         ignore_index: int = -100,
         reduction: str = "mean",
+        time_weighting: str = "inverse_t",
         # path: MixtureDiscreteProbPath = None,
     ):
         super().__init__()
         self.fp32_upcast = fp32_upcast
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self.time_weighting = time_weighting
+
+    def _compute_time_weight(self, t: torch.Tensor) -> torch.Tensor:
+        if self.time_weighting == "inverse_t":
+            return 1 / t.clamp(min=1e-3)
+        if self.time_weighting == "disable":
+            return torch.ones_like(t)
+        raise ValueError(
+            f"{self.time_weighting} is not a valid value for time_weighting; "
+            "expected one of {'inverse_t', 'disable'}"
+        )
 
     @staticmethod
     def compute_macro_average_loss(per_token_loss, loss_mask, response_mask):
@@ -117,7 +129,7 @@ class WeightedCrossEntropy(nn.Module):
         if self.fp32_upcast:
             logits = logits.float()
 
-        loss_weight = 1 / t
+        loss_weight = self._compute_time_weight(t)
         per_token_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), # [B * seq_len, vocab_size]
             labels.view(-1), # [B * seq_len]

@@ -307,6 +307,8 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0], state_dict, quantization=self.config.dequantize_base_checkpoint
         )
+        if is_init_step and storage_reader is not None:
+            state_dict = self._filter_missing_init_state_dict_keys(state_dict, storage_reader, model_path)
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
@@ -379,6 +381,34 @@ class Checkpointer:
         self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
             model.tie_weights()
+
+    def _filter_missing_init_state_dict_keys(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        storage_reader: _HuggingFaceStorageReader,
+        model_path: str,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Drop target parameters that are absent from the base checkpoint.
+
+        During init-from-base we may load a checkpoint into an extended model
+        architecture that introduces new parameters. Those parameters should
+        retain their freshly initialized values instead of being requested from
+        DCP, which would otherwise fail during load-plan construction.
+        """
+        metadata = storage_reader.read_metadata()
+        available_keys = set(metadata.state_dict_metadata.keys())
+        missing_keys = [key for key in state_dict.keys() if key not in available_keys]
+        if not missing_keys:
+            return state_dict
+
+        logging.info(
+            "Skipping %d parameters missing from base checkpoint %s. First missing keys: %s",
+            len(missing_keys),
+            model_path,
+            ", ".join(missing_keys[:8]),
+        )
+        return {key: value for key, value in state_dict.items() if key in available_keys}
 
     def maybe_wait_for_staging(self) -> None:
         """

@@ -75,6 +75,11 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.recipes.vlm.selective_logits import (
+    _check_no_cp,
+    _num_samples,
+    _select_response,
+)
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -127,6 +132,38 @@ def _freeze_model(model: nn.Module, cfg_freeze: Optional[Dict[str, Any]] = None,
                 m.weight.requires_grad = False
     return model
 
+
+def _get_optimizer_group_family(group_name):
+    if not group_name:
+        return None
+    for family in ("visual", "language", "merger"):
+        if group_name.startswith(f"{family}_"):
+            return family
+    return None
+
+
+def _build_optimizer_group_index_map(param_groups):
+    index_map = {}
+    for idx, group in enumerate(param_groups):
+        family = _get_optimizer_group_family(group.get("group_name"))
+        if family is None:
+            continue
+        index_map.setdefault(family, []).append(idx)
+    return index_map
+
+
+def _get_optimizer_group_lr(optimizer, family):
+    group_indices = getattr(optimizer, "_vlm_group_indices", None) or {}
+    for idx in group_indices.get(family, []):
+        if idx < len(optimizer.param_groups):
+            return optimizer.param_groups[idx]["lr"]
+
+    for group in optimizer.param_groups:
+        if _get_optimizer_group_family(group.get("group_name")) == family:
+            return group["lr"]
+
+    return None
+
 # Modified: to support multiple groups
 def get_parameter_groups(model, cfg_opt):
     # be careful here, now is only designed for qwen-vl series model.
@@ -138,6 +175,7 @@ def get_parameter_groups(model, cfg_opt):
 
     groups = {
         "visual_decay": {
+            "group_name": "visual_decay",
             "params": [],
             "lr": visual_lr,
             "max_lr": visual_lr,
@@ -147,6 +185,7 @@ def get_parameter_groups(model, cfg_opt):
             "wd_mult": weight_decay,
         },
         "visual_no_decay": {
+            "group_name": "visual_no_decay",
             "params": [],
             "lr": visual_lr,
             "max_lr": visual_lr,
@@ -156,6 +195,7 @@ def get_parameter_groups(model, cfg_opt):
             "wd_mult": 0.0,
         },
         "language_decay": {
+            "group_name": "language_decay",
             "params": [],
             "lr": language_lr,
             "max_lr": language_lr,
@@ -165,6 +205,7 @@ def get_parameter_groups(model, cfg_opt):
             "wd_mult": weight_decay,
         },
         "language_no_decay": {
+            "group_name": "language_no_decay",
             "params": [],
             "lr": language_lr,
             "max_lr": language_lr,
@@ -174,6 +215,7 @@ def get_parameter_groups(model, cfg_opt):
             "wd_mult": 0.0,
         },
         "merger_decay": {
+            "group_name": "merger_decay",
             "params": [],
             "lr": merger_lr,
             "max_lr": merger_lr,
@@ -183,6 +225,7 @@ def get_parameter_groups(model, cfg_opt):
             "wd_mult": weight_decay,
         },
         "merger_no_decay": {
+            "group_name": "merger_no_decay",
             "params": [],
             "lr": merger_lr,
             "max_lr": merger_lr,
@@ -191,7 +234,8 @@ def get_parameter_groups(model, cfg_opt):
             "weight_decay": 0.0,
             "wd_mult": 0.0,
         },
-        "other": {
+        "other_decay": {
+            "group_name": "other_decay",
             "params": [],
             "lr": base_lr,
             "max_lr": base_lr,
@@ -199,6 +243,16 @@ def get_parameter_groups(model, cfg_opt):
             "init_lr": base_lr * 0.1,
             "weight_decay": weight_decay,
             "wd_mult": weight_decay,
+        },
+        "other_no_decay": {
+            "group_name": "other_no_decay",
+            "params": [],
+            "lr": base_lr,
+            "max_lr": base_lr,
+            "min_lr": base_lr * 0.05,
+            "init_lr": base_lr * 0.1,
+            "weight_decay": 0.0,
+            "wd_mult": 0.0,
         },
     }
 
@@ -211,7 +265,8 @@ def get_parameter_groups(model, cfg_opt):
     language_no_decay_names = []
     merger_decay_names = []
     merger_no_decay_names = []
-    other_names = []
+    other_decay_names = []
+    other_no_decay_names = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -224,21 +279,21 @@ def get_parameter_groups(model, cfg_opt):
 
         is_no_decay = any(k in name.lower() for k in no_decay_keywords) or (param.ndim <= 1)
 
-        if "visual.merger" in name or "deepstack_merger_list" in name:
+        if "visual.merger" in name or "deepstack_merger_list" in name or "multi_modal_projector" in name:
             if is_no_decay:
                 groups["merger_no_decay"]["params"].append(param)
                 merger_no_decay_names.append(name)
             else:
                 groups["merger_decay"]["params"].append(param)
-                merger_decay_names.append(name)    
-        elif "visual" in name:
+                merger_decay_names.append(name)
+        elif "visual" in name or "vision_tower" in name:
             if is_no_decay:
                 groups["visual_no_decay"]["params"].append(param)
                 visual_no_decay_names.append(name)
             else:
                 groups["visual_decay"]["params"].append(param)
                 visual_decay_names.append(name)    
-        elif "language_model" in name or "lm_head" in name:
+        elif name.startswith("model.") or "language_model" in name or "lm_head" in name:
             if is_no_decay:
                 groups["language_no_decay"]["params"].append(param)
                 language_no_decay_names.append(name)    
@@ -246,8 +301,12 @@ def get_parameter_groups(model, cfg_opt):
                 groups["language_decay"]["params"].append(param)
                 language_decay_names.append(name)    
         else:
-            groups["other"]["params"].append(param)
-            other_names.append(name)
+            if is_no_decay:
+                groups["other_no_decay"]["params"].append(param)
+                other_no_decay_names.append(name)
+            else:
+                groups["other_decay"]["params"].append(param)
+                other_decay_names.append(name)
 
     param_groups = [v for k, v in groups.items() if len(v["params"]) > 0]
 
@@ -392,6 +451,7 @@ def build_model_and_optimizer(
 
         param_groups = get_parameter_groups(model, cfg_opt)
         assert len(param_groups) > 0, "No trainable parameters found!"
+        optimizer_group_indices = _build_optimizer_group_index_map(param_groups)
 
         # remove useless field
         if hasattr(cfg_opt, 'visual_lr'):
@@ -400,6 +460,7 @@ def build_model_and_optimizer(
             delattr(cfg_opt, 'merger_lr')
 
         optimizer = cfg_opt.instantiate(params=param_groups)
+        optimizer._vlm_group_indices = optimizer_group_indices
 
         return model, state_dict_keys, optimizer
 
@@ -498,6 +559,16 @@ def build_dataloader(
             ds_dict = {k: v for k, v in cfg_ds.__dict__.items() if not k.startswith('_')}
             ds = cfg_ds.instantiate(**ds_dict)
 
+        collate_cfg = cfg_dl.get("collate_fn", None)
+        if collate_cfg:
+            collate_fn = collate_cfg.instantiate(processor=processor, max_len=cfg_ds.max_len)
+        else:
+            processor_type = type(processor).__name__
+            if processor_type not in COLLATE_FNS:
+                processor_type = "default"
+                logging.warning(f"You are using {processor_type} with default collate function.")
+            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
         dataset_meta = ds.get_metadata()
         if dataset_meta is not None:
             logging.info("Using BalanceSampler.")
@@ -510,33 +581,69 @@ def build_dataloader(
                 drop_last=cfg_ds.drop_last,
                 **dist_sampler_kwargs,
             )
+            dl_kwargs = dict(
+                dataset=ds,
+                batch_sampler=sampler,
+                collate_fn=collate_fn,
+            )
         else:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 ds,
                 **dist_sampler_kwargs,
             )
-
-        collate_cfg = cfg_dl.get("collate_fn", None)
-        if collate_cfg:
-            collate_fn = collate_cfg.instantiate(processor=processor, max_len=cfg_ds.max_len)
-        else:
-            processor_type = type(processor).__name__
-            if processor_type not in COLLATE_FNS:
-                processor_type = "default"
-                logging.warning(f"You are using {processor_type} with default collate function.")
-            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
-
-        dl_kwargs = dict(
-            dataset=ds,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            batch_size=local_batch_size,
-        )
+            dl_kwargs = dict(
+                dataset=ds,
+                sampler=sampler,
+                collate_fn=collate_fn,
+                batch_size=local_batch_size,
+            )
         # DataLoader workers should use spawn to avoid CUDA fork-safety issues.
         if cfg_dl.get("num_workers", 0) > 0 and cfg_dl.get("multiprocessing_context", None) is None:
             dl_kwargs["multiprocessing_context"] = "spawn"
 
         return cfg_dl.instantiate(**dl_kwargs), processor
+
+
+def build_multi_task_dataloader(
+    cfg, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size
+) -> tuple:
+    """Build a MultiTaskDataLoader when task_weights is configured.
+
+    Constructs independent DataLoaders for each task (understanding, generation, editing)
+    and wraps them in a MultiTaskDataLoader that yields batches interleaved by weight.
+
+    Returns:
+        (MultiTaskDataLoader, processor)
+    """
+    from nemo_automodel.components.datasets.vlm.multi_task_dataloader import MultiTaskDataLoader
+
+    task_weights = cfg.task_weights.to_dict() if hasattr(cfg.task_weights, "to_dict") else dict(cfg.task_weights)
+
+    # Build the primary (understanding) dataloader
+    primary_dl, processor = build_dataloader(
+        cfg.dataset, cfg.dataloader, pretrained_model_name_or_path,
+        cfg_processor, device_mesh, seed, local_batch_size,
+    )
+    dataloaders = {"understanding": primary_dl}
+
+    # Build generation dataloader if configured
+    if "generation_dataset" in cfg and "generation_dataloader" in cfg:
+        gen_dl, _ = build_dataloader(
+            cfg.generation_dataset, cfg.generation_dataloader, pretrained_model_name_or_path,
+            cfg_processor, device_mesh, seed, local_batch_size,
+        )
+        dataloaders["generation"] = gen_dl
+
+    # Build editing dataloader if configured
+    if "editing_dataset" in cfg and "editing_dataloader" in cfg:
+        edit_dl, _ = build_dataloader(
+            cfg.editing_dataset, cfg.editing_dataloader, pretrained_model_name_or_path,
+            cfg_processor, device_mesh, seed, local_batch_size,
+        )
+        dataloaders["editing"] = edit_dl
+
+    multi_dl = MultiTaskDataLoader(dataloaders, task_weights, seed=seed)
+    return multi_dl, processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -628,6 +735,15 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> OptimizerParamSchedule
     if cfg is not None:
         user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
         default_kwargs.update(user_cfg)
+
+    # Clamp warmup to be strictly less than total decay steps
+    if default_kwargs["lr_warmup_steps"] >= default_kwargs["lr_decay_steps"]:
+        clamped = max(default_kwargs["lr_decay_steps"] - 1, 0)
+        logger.warning(
+            f"lr_warmup_steps ({default_kwargs['lr_warmup_steps']}) >= lr_decay_steps ({default_kwargs['lr_decay_steps']}), "
+            f"clamping to {clamped}"
+        )
+        default_kwargs["lr_warmup_steps"] = clamped
 
     logger.info(
         f"Building LR scheduler with total_steps={total_steps}, "
@@ -735,6 +851,60 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 
     return loss_fn(**loss_fn_kwargs)
 
+
+def _compute_dual_head_loss(
+    loss_fn, out, labels, generation_mask, *,
+    x_t, t, loss_mask, response_mask, num_label_tokens, num_samples, block_size,
+):
+    """Dual-head loss for Bard-Uni: text region uses lm_head, VQ region uses image_head."""
+    logits = out.logits
+    image_logits = getattr(out, "image_logits", None)
+    device = logits.device
+
+    text_mask = loss_mask & ~generation_mask
+    text_tokens = int(text_mask.sum().item())
+    text_loss = torch.tensor(0.0, device=device)
+
+    if text_tokens > 0:
+        text_loss = loss_fn(
+            logits=logits, labels=labels, x_t=x_t, t=t,
+            response_mask=response_mask, loss_mask=text_mask,
+            num_label_tokens=max(text_tokens, 1),
+            num_samples=num_samples, block_size=block_size,
+        )
+
+    vq_mask = loss_mask & generation_mask
+    vq_tokens = int(vq_mask.sum().item())
+    vq_loss = torch.tensor(0.0, device=device)
+
+    if vq_tokens > 0 and image_logits is not None:
+        # Clamp labels to valid range for image_head (codebook_size)
+        vq_labels = labels.clamp(0, image_logits.size(-1) - 1)
+        vq_loss = loss_fn(
+            logits=image_logits, labels=vq_labels, x_t=x_t, t=t,
+            response_mask=response_mask, loss_mask=vq_mask,
+            num_label_tokens=max(vq_tokens, 1),
+            num_samples=num_samples, block_size=block_size,
+        )
+
+    total_tokens = max(text_tokens + vq_tokens, 1)
+    total_loss = (text_loss * text_tokens + vq_loss * vq_tokens) / total_tokens
+
+    # Debug: print grad info on first call
+    if not hasattr(_compute_dual_head_loss, "_debug_printed"):
+        _compute_dual_head_loss._debug_printed = True
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(
+            f"[dual_head_loss] text_tokens={text_tokens}, vq_tokens={vq_tokens}, "
+            f"image_logits is None={image_logits is None}, "
+            f"total_loss.requires_grad={total_loss.requires_grad}, "
+            f"total_loss.grad_fn={total_loss.grad_fn}"
+        )
+
+    return total_loss
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -834,15 +1004,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         self.checkpointer.config.model_state_dict_keys = model_state_dict_keys
 
-        self.dataloader, self.processor = build_dataloader(
-            self.cfg.dataset,
-            self.cfg.dataloader,
-            _get_model_name(self.cfg.model),
-            self.cfg.get("processor", None),
-            device_mesh=self.device_mesh,
-            seed=self.cfg.get("seed", 42),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-        )
+        if "task_weights" in self.cfg:
+            self.dataloader, self.processor = build_multi_task_dataloader(
+                self.cfg,
+                _get_model_name(self.cfg.model),
+                self.cfg.get("processor", None),
+                device_mesh=self.device_mesh,
+                seed=self.cfg.get("seed", 42),
+                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            )
+        else:
+            self.dataloader, self.processor = build_dataloader(
+                self.cfg.dataset,
+                self.cfg.dataloader,
+                _get_model_name(self.cfg.model),
+                self.cfg.get("processor", None),
+                device_mesh=self.device_mesh,
+                seed=self.cfg.get("seed", 42),
+                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
@@ -981,6 +1161,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         for i, batch in enumerate(batches): # accumulation_steps维度迭代
             batch = to_device(batch, self.dist_env.device)
             labels = batch.pop("labels")
+            generation_mask = batch.pop("generation_mask", None)
 
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels) # local_batch_size维度迭代
             with (
@@ -991,40 +1172,83 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     defer_fsdp_grad_sync=getattr(self.model_wrapper, "defer_fsdp_grad_sync", True),
                 ),
             ):
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = self.model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = self.model(**batch)
+                if generation_mask is not None and generation_mask.any():
+                    # Bard-Uni dual-head path: full-sequence forward, split loss by generation_mask
+                    batch["generation_mask"] = generation_mask
+                    if "vq_code_mask" in batch:
+                        batch["vq_codes"] = batch["input_ids"].clone()
+                    out = self.model(labels=labels, **batch)
 
-                ########### origin CrossEntropyLoss #############
-                # local_loss = calculate_loss(
-                #     self.loss_fn,
-                #     logits=getattr(out, "logits", out),
-                #     labels=labels,
-                #     model=self.model,
-                #     hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
-                #     num_label_tokens=num_label_tokens,
-                # )
-                ######## modified for GeneralizedKL loss ########
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=self.model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
-                    num_label_tokens=num_label_tokens,
-                    x_t=batch.get("input_ids", None),
-                    t=batch.get("t", None),
-                    loss_mask=batch.get("loss_mask", None),
-                    response_mask=batch.get("response_mask", None),
-                    block_size=batch.get("block_size") if "block_size" in batch else 0, # for block diffusion.
-                    num_samples=num_total_samples,
-                )
+                    # Debug: check model output type on first call
+                    if not hasattr(self, "_out_debug_done"):
+                        self._out_debug_done = True
+                        _img_logits = getattr(out, "image_logits", "MISSING")
+                        logging.info(
+                            f"[train debug] out type={type(out).__name__}, "
+                            f"has image_logits={hasattr(out, 'image_logits')}, "
+                            f"image_logits is None={_img_logits is None}, "
+                            f"model class={type(self.model).__name__}, "
+                            f"batch keys={list(batch.keys())}"
+                        )
+
+                    local_loss = _compute_dual_head_loss(
+                        self.loss_fn, out, labels, generation_mask,
+                        x_t=batch.get("input_ids"),
+                        t=batch.get("t"),
+                        loss_mask=batch.get("loss_mask"),
+                        response_mask=batch.get("response_mask"),
+                        num_label_tokens=num_label_tokens,
+                        num_samples=num_total_samples,
+                        block_size=batch.get("block_size", 0),
+                    )
+                else:
+                    # Standard single-head path (Bard-VL / understanding-only)
+                    use_selected_response_logits = isinstance(
+                        self.loss_fn,
+                        (MixturePathGeneralizeKL, WeightedCrossEntropy),
+                    )
+                    if use_selected_response_logits:
+                        _check_no_cp(self.device_mesh, "Selective noisy-response logits")
+
+                    selected_response = None
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                        out = self.model(logits_to_keep=1, labels=labels, **batch)
+                        if "hidden_states" not in out:
+                            raise ValueError(
+                                "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            )
+                    else:
+                        if use_selected_response_logits:
+                            selected_response = _select_response(
+                                batch["response_mask"],
+                                {
+                                    "labels": (labels, 0),
+                                    "input_ids": (batch["input_ids"], 0),
+                                    "t": (batch["t"], 0.0),
+                                    "loss_mask": (batch["loss_mask"], False),
+                                    "response_mask": (batch["response_mask"], False),
+                                },
+                                empty_error="No noisy response tokens available for selective logits.",
+                            )
+                            out = self.model(logits_to_keep=selected_response["indices"], labels=labels, **batch)
+                        else:
+                            out = self.model(labels=labels, **batch)
+
+                    local_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=getattr(out, "logits", out),
+                        labels=selected_response["labels"] if selected_response is not None else labels,
+                        model=self.model,
+                        hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                        num_label_tokens=num_label_tokens,
+                        x_t=selected_response["input_ids"] if selected_response is not None else batch.get("input_ids", None),
+                        t=selected_response["t"] if selected_response is not None else batch.get("t", None),
+                        loss_mask=selected_response["loss_mask"] if selected_response is not None else batch.get("loss_mask", None),
+                        response_mask=selected_response["response_mask"] if selected_response is not None else batch.get("response_mask", None),
+                        block_size=batch.get("block_size") if "block_size" in batch else 0,
+                        num_samples=num_total_samples,
+                    )
+
                 loss_buffer.append(local_loss.clone().detach())
                 local_loss.backward()
 
@@ -1081,24 +1305,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True).item()
         # fix reporting_loss, tps across ranks
 
+        metrics = {
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
+            "single_samples": num_samples,
+            "total_samples": num_total_samples, # total train samples in each iteration
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        }
+        for family in ("visual", "merger", "language"):
+            lr = _get_optimizer_group_lr(self.optimizer, family)
+            if lr is not None:
+                metrics[f"{family}_lr"] = lr
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                # "lr": self.optimizer.param_groups[0]["lr"],
-                "visual_lr": self.optimizer.param_groups[0]["lr"],      # HARDCODE HERE, be careful!
-                "merger_lr": self.optimizer.param_groups[4]["lr"],      # HARDCODE HERE, be careful!
-                "language_lr": self.optimizer.param_groups[2]["lr"],    # HARDCODE HERE, be careful!
-                "single_samples": num_samples,
-                "total_samples": num_total_samples, # total train samples in each iteration
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -1113,7 +1339,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for batch in val_dataloader:
                 batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
+                generation_mask = batch.pop("generation_mask", None)
+                num_label_tokens = int(batch["loss_mask"].sum().item()) if "loss_mask" in batch else int((labels != -100).sum().item())
 
                 if (
                     self.device_mesh
@@ -1126,20 +1353,64 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model(logits_to_keep=1, **batch)
+                    if generation_mask is not None and generation_mask.any():
+                        batch["generation_mask"] = generation_mask
+                        if "vq_code_mask" in batch:
+                            batch["vq_codes"] = batch["input_ids"].clone()
+                        out = self.model(labels=labels, **batch)
+                        local_loss = _compute_dual_head_loss(
+                            self.loss_fn, out, labels, generation_mask,
+                            x_t=batch.get("input_ids"),
+                            t=batch.get("t"),
+                            loss_mask=batch.get("loss_mask"),
+                            response_mask=batch.get("response_mask"),
+                            num_label_tokens=num_label_tokens,
+                            num_samples=_num_samples(batch),
+                            block_size=batch.get("block_size", 0),
+                        )
                     else:
-                        out = self.model(**batch)
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model,
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
+                        use_selected_response_logits = isinstance(
+                            self.loss_fn,
+                            (MixturePathGeneralizeKL, WeightedCrossEntropy),
+                        )
+                        if use_selected_response_logits:
+                            _check_no_cp(self.device_mesh, "Selective noisy-response logits")
+
+                        selected_response = None
+                        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                            out = self.model(logits_to_keep=1, labels=labels, **batch)
+                        else:
+                            if use_selected_response_logits:
+                                selected_response = _select_response(
+                                    batch["response_mask"],
+                                    {
+                                        "labels": (labels, 0),
+                                        "input_ids": (batch["input_ids"], 0),
+                                        "t": (batch["t"], 0.0),
+                                        "loss_mask": (batch["loss_mask"], False),
+                                        "response_mask": (batch["response_mask"], False),
+                                    },
+                                    empty_error="No noisy response tokens available for selective logits during validation.",
+                                )
+                                out = self.model(logits_to_keep=selected_response["indices"], labels=labels, **batch)
+                            else:
+                                out = self.model(labels=labels, **batch)
+                        local_loss = calculate_loss(
+                            self.loss_fn,
+                            logits=getattr(out, "logits", out),
+                            labels=selected_response["labels"] if selected_response is not None else labels,
+                            model=self.model,
+                            hidden_states=out.hidden_states[-1]
+                            if getattr(out, "hidden_states", None) is not None
+                            else None,
+                            num_label_tokens=num_label_tokens,
+                            x_t=selected_response["input_ids"] if selected_response is not None else batch.get("input_ids", None),
+                            t=selected_response["t"] if selected_response is not None else batch.get("t", None),
+                            loss_mask=selected_response["loss_mask"] if selected_response is not None else batch.get("loss_mask", None),
+                            response_mask=selected_response["response_mask"] if selected_response is not None else batch.get("response_mask", None),
+                            block_size=batch.get("block_size") if "block_size" in batch else 0,
+                            num_samples=_num_samples(batch),
+                        )
                     total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item() * num_label_tokens
@@ -1225,23 +1496,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
         #     )
         # )
 
-        logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | visual_lr {:.2e} | merger_lr {:.2e} | language_lr {:.2e} | single_samples {:d} | total_samples {:d} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["loss"],
-                log_data.metrics["grad_norm"],
-                log_data.metrics["visual_lr"],
-                log_data.metrics["merger_lr"],
-                log_data.metrics["language_lr"],
-                log_data.metrics["single_samples"],
-                log_data.metrics["total_samples"],
-                log_data.metrics["mem"],
-                log_data.metrics["tps"],
-                log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
-            )
+        parts = [
+            f"step {log_data.step}",
+            f"epoch {log_data.epoch}",
+            f"loss {log_data.metrics['loss']:.4f}",
+            f"grad_norm {log_data.metrics['grad_norm']:.4f}",
+        ]
+        for family in ("visual", "merger", "language"):
+            key = f"{family}_lr"
+            if key in log_data.metrics:
+                parts.append(f"{key} {log_data.metrics[key]:.2e}")
+        parts.extend(
+            [
+                f"single_samples {log_data.metrics['single_samples']:d}",
+                f"total_samples {log_data.metrics['total_samples']:d}",
+                f"mem {log_data.metrics['mem']:.2f} GiB",
+                f"tps {log_data.metrics['tps']:.2f}({log_data.metrics['tps_per_gpu']:.2f}/gpu)",
+                f"num_label_tokens {log_data.metrics['num_label_tokens']}",
+            ]
         )
+        logging.info(" | ".join(parts))
                 
         torch.cuda.reset_peak_memory_stats()
 
